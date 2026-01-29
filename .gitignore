@@ -18,3 +18,5 @@ occ_gt_vis.png
 backup
 PandaSet
 *.pyc
+datasets
+__pycache__/
