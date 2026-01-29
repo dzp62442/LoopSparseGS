@@ -48,26 +48,30 @@
 We have validated our code on the following equipment:
 
 - Unbuntu 18.04  or Win 11
-- Py 3.8 + cuda 11.3 + torch 11.7
+- Py 3.8 + cuda 11.7 + torch 1.13.1
 - colmap >= 3.7
 
 ### 1.2  Setup
 
 Please run the following commands to clone the repository and install the required packages.
 If COLMAP is not installed in your environment, please follow the [official instructions](https://colmap.github.io/install.html).
-```
+```shell
 git clone https://github.com/pcl3dv/LoopSparseGS.git
 cd LoopSparseGS
 
 conda env create --file environment.yml
 conda activate loopsparsegs
+pip install torch==1.13.1+cu117 torchvision==0.14.1+cu117 torchaudio==0.13.1 --extra-index-url https://download.pytorch.org/whl/cu117
+pip install timm==1.0.15 torchmetrics==1.5.2 tensorboard==2.14.0
+pip install submodules/diff-gaussian-rasterization-weights
+pip install submodules/simple-knn
 ```
 
 ### 1.3  Data Preparation
 Download LLFF from [offical link](https://drive.google.com/drive/folders/128yBriW1IG_3NJ5Rp7APSTZsJqdJdfc1) or [mirrored link](https://drive.google.com/file/d/11PhkBXZZNYTD2emdG1awALlhCnkq7aN-/view). Make sure the downloaded data is located at `data/nerf_llff_data/scene`.
 
 Before training, please run the following code for acquiring the initial `n-views colmap files` and `projected depths`.
-```
+```shell
 cd LoopSparseGS
 python tools/pre_llff.py
 ```
@@ -80,7 +84,7 @@ The training paradigm is:
 ### 2.1  Training and Looping
 **Scripts**: You can run the script file to train the LLFF scenes (*e.g.* fern).
 
-```
+```shell
 cd LoopSparseGS
 bash script/train_llff.sh fern
 ```
@@ -105,14 +109,14 @@ For `loop.py`:
 The `render` process runs automatically at the end of each `training` phase.
 Use the following command if you need to render again manually.
 
-```
+```shell
 python render.py -m output/fern --skip_train --render_depth
 ```
 
 ### 2.3  Evaluation
 During the `training` process, we record metrics every 1000 epochs and store them in `$model_path$/record_psnr.txt`.
 The following code can be used for any additional processing needs.
-```
+```shell
 python metrics.py -m ./output/fern
 ```
 
