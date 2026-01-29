@@ -1,4 +1,5 @@
 import os
+import numpy as np
 import torch
 from random import randint
 from utils.loss_utils import l1_loss, ssim, compute_pearson_loss, compute_patch_pearson_loss, compute_depth_loss
@@ -310,7 +311,23 @@ def training_report(tb_writer, iteration, Ll1, pearson_loss, depth_loss, loss, l
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - lpips', lpips_test, iteration)
 
         if tb_writer:
-            tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
+            opacity = scene.gaussians.get_opacity.detach().float().cpu().view(-1)
+            opacity = opacity[torch.isfinite(opacity)]
+            opacity_cpu = np.asarray(opacity.numpy(), dtype=np.float64)
+            if opacity_cpu.size > 0:
+                counts, limits = np.histogram(opacity_cpu, bins=tb_writer.default_bins)
+                sum_sq = float(opacity_cpu.dot(opacity_cpu))
+                tb_writer.add_histogram_raw(
+                    tag="scene/opacity_histogram",
+                    min=float(opacity_cpu.min()),
+                    max=float(opacity_cpu.max()),
+                    num=int(opacity_cpu.size),
+                    sum=float(opacity_cpu.sum()),
+                    sum_squares=sum_sq,
+                    bucket_limits=limits[1:].tolist(),
+                    bucket_counts=counts.tolist(),
+                    global_step=iteration,
+                )
             tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
         torch.cuda.empty_cache()
         return {
