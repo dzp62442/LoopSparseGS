@@ -346,6 +346,10 @@ if __name__ == "__main__":
     parser.add_argument("--epoch_number", type=int, default = -1, help="hyper-parameters need consider the n_views epoches.")
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
+
+    if args.dataset_type == "omniscene":
+        # OmniScene 不使用伪视角，避免依赖 COLMAP 伪视角深度
+        args.use_pseudo_view = False
     
     print("Optimizing " + args.model_path)
 

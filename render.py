@@ -104,6 +104,10 @@ if __name__ == "__main__":
     args = get_combined_args(parser)
     print("Rendering " + args.model_path)
 
+    if args.dataset_type == "omniscene":
+        # OmniScene 不使用伪视角
+        args.use_pseudo_view = False
+
     # Initialize system state (RNG)
     safe_state(args.quiet)
 
