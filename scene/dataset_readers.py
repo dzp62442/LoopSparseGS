@@ -36,6 +36,7 @@ class CameraInfo(NamedTuple):
     width: int
     height: int
     bounds: np.array
+    depth_scale: float = 1.0
 
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
@@ -314,6 +315,77 @@ def readColmapSceneInfo(path, images, eval, dataset_type=None, train_sub=-1, pse
                            ply_path=ply_path)
     return scene_info
 
+
+def readOmniSceneCameras(json_path: str, scene_root: str):
+    """读取 OmniScene 预处理相机 JSON，构造 CameraInfo 列表。"""
+    cam_infos = []
+    data = json.load(open(json_path, "r"))
+    for idx, frame in enumerate(data["frames"]):
+        image_path = os.path.join(scene_root, frame["file_path"])
+        image_name = frame["image_name"]
+        image = Image.open(image_path)
+
+        intr = np.array(frame["intrinsics"], dtype=np.float32)
+        width = int(frame["width"])
+        height = int(frame["height"])
+
+        fx, fy = intr[0, 0], intr[1, 1]
+        FovY = focal2fov(fy, height)
+        FovX = focal2fov(fx, width)
+
+        c2w = np.array(frame["c2w"], dtype=np.float32)
+        w2c = np.linalg.inv(c2w)
+        R = c2w[:3, :3]
+        T = w2c[:3, 3]
+
+        depth_path = os.path.join(scene_root, frame["depth_path"])
+        cam_info = CameraInfo(
+            uid=idx,
+            R=R,
+            T=T,
+            FovY=FovY,
+            FovX=FovX,
+            image=image,
+            image_path=image_path,
+            depth_path=depth_path,
+            image_name=image_name,
+            width=width,
+            height=height,
+            bounds=np.array([0.0, 0.0], dtype=np.float32),
+            depth_scale=frame.get("depth_scale", 1.0),
+        )
+        cam_infos.append(cam_info)
+    return cam_infos
+
+
+def readOmniSceneInfo(path, images, eval, dataset_type=None, train_sub=-1, pseudo_loop_iters=0, PMS_init=False, debug_init=False):
+    """读取 OmniScene 预处理数据。"""
+    train_json = os.path.join(path, "cams", "train.json")
+    test_json = os.path.join(path, "cams", "test.json")
+    assert os.path.exists(train_json), f"缺少训练相机文件: {train_json}"
+    assert os.path.exists(test_json), f"缺少测试相机文件: {test_json}"
+
+    train_cam_infos = readOmniSceneCameras(train_json, path)
+    test_cam_infos = readOmniSceneCameras(test_json, path)
+
+    if not eval:
+        test_cam_infos = []
+
+    nerf_normalization = getNerfppNorm(train_cam_infos)
+    ply_path = os.path.join(path, "points", "init_points.ply")
+    if not os.path.exists(ply_path):
+        print(f"[Warning] 未找到初始化点云: {ply_path}，将返回空点云。")
+    pcd = fetchPly(ply_path) if os.path.exists(ply_path) else None
+
+    scene_info = SceneInfo(
+        point_cloud=pcd,
+        train_cameras=train_cam_infos,
+        test_cameras=test_cam_infos,
+        nerf_normalization=nerf_normalization,
+        ply_path=ply_path,
+    )
+    return scene_info
+
 def readCamerasFromTransforms(path, transformsfile, white_background, extension=".png"):
     cam_infos = []
 
@@ -394,5 +466,6 @@ def readNerfSyntheticInfo(path, white_background, eval, extension=".png"):
 
 sceneLoadTypeCallbacks = {
     "Colmap": readColmapSceneInfo,
-    "Blender" : readNerfSyntheticInfo
+    "Blender" : readNerfSyntheticInfo,
+    "OmniScene": readOmniSceneInfo,
 }

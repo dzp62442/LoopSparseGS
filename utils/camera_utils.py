@@ -46,7 +46,14 @@ def loadCam(args, id, cam_info, resolution_scale):
     loaded_mask = None
     
     if args.use_depth and os.path.exists(cam_info.depth_path):
-        depth = imageio.imread(cam_info.depth_path)
+        if cam_info.depth_path.endswith(".npy"):
+            depth = np.load(cam_info.depth_path)
+        else:
+            depth = imageio.imread(cam_info.depth_path)
+        depth = np.array(depth, dtype=np.float32)
+        depth_scale = getattr(cam_info, "depth_scale", 1.0)
+        if depth_scale not in [None, 0]:
+            depth = depth / float(depth_scale)
         mono_depth = estimate_depth(gt_image.cuda()).cpu().numpy()
         print('depth load from {}'.format(cam_info.depth_path))
     else:

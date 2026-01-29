@@ -47,7 +47,11 @@ class Scene:
         self.test_cameras = {}
         self.pseudo_cameras = {}
 
-        if os.path.exists(os.path.join(args.source_path, "sparse")):
+        if dataset_type == "omniscene":
+            scene_info = sceneLoadTypeCallbacks["OmniScene"](args.source_path, args.images, args.eval, \
+                                                          dataset_type=dataset_type, train_sub=train_sub, \
+                                                          pseudo_loop_iters=args.pseudo_loop_iters, PMS_init=PMS_init, debug_init=debug_init)
+        elif os.path.exists(os.path.join(args.source_path, "sparse")):
             scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval, \
                                                           dataset_type=dataset_type, train_sub=train_sub, \
                                                           pseudo_loop_iters=args.pseudo_loop_iters, PMS_init=PMS_init, debug_init=debug_init)
