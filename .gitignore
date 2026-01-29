@@ -19,3 +19,4 @@ backup
 PandaSet
 *.pyc
 datasets
+__pycache__/
