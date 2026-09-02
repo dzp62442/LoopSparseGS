@@ -2,12 +2,18 @@ import json
 import os
 import os.path as osp
 import pickle as pkl
+import re
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
 import numpy as np
 from PIL import Image
 import imageio.v2 as imageio
+
+
+CENTER150_FILENAME = "bins_center150_v1.json"
+CENTER150_SAMPLE_COUNT = 150
+BIN_TOKEN_PATTERN = re.compile(r"^scene([0-9a-f]+)_bin(\d+)$")
 
 
 @dataclass
@@ -169,10 +175,110 @@ def _store_ply(path: str, xyz: np.ndarray, rgb: np.ndarray) -> None:
     PlyData([vertex_element]).write(path)
 
 
+def _load_json_object(path: str, description: str) -> Dict:
+    if not osp.isfile(path):
+        raise FileNotFoundError(
+            f"{description}不存在: {path}。Center150 清单只能由 SVF-GS 项目生成。"
+        )
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise ValueError(f"{description}必须是 JSON object: {path}")
+    return data
+
+
+def _parse_bin_token(bin_token: str) -> Tuple[str, int]:
+    if not isinstance(bin_token, str):
+        raise ValueError(f"bin token 必须是字符串，实际为 {type(bin_token).__name__}")
+    match = BIN_TOKEN_PATTERN.fullmatch(bin_token)
+    if match is None:
+        raise ValueError(f"非法 bin token: {bin_token}")
+    return match.group(1), int(match.group(2))
+
+
+def _expected_center150_tokens(val_manifest: Dict) -> List[str]:
+    """仅在内存中复算 SVF-GS lower-median 规则，用于校验现有清单。"""
+    all_bins = val_manifest.get("bins")
+    adjacent_bins = val_manifest.get("adjacent_bins")
+    if not isinstance(all_bins, list) or not isinstance(adjacent_bins, list):
+        raise ValueError("bins_val_3.2m.json 必须包含 list 字段 'bins' 和 'adjacent_bins'")
+    if len(adjacent_bins) != CENTER150_SAMPLE_COUNT:
+        raise ValueError(
+            f"OmniScene val 应包含 {CENTER150_SAMPLE_COUNT} 个场景，实际为 {len(adjacent_bins)}"
+        )
+
+    flattened_bins = [token for scene_bins in adjacent_bins for token in scene_bins]
+    if flattened_bins != all_bins:
+        raise ValueError("bins_val_3.2m.json 中 adjacent_bins 展平后与 bins 不完全一致")
+
+    selected_bins = []
+    selected_scenes = set()
+    for scene_index, scene_bins in enumerate(adjacent_bins):
+        if not isinstance(scene_bins, list) or not scene_bins:
+            raise ValueError(f"val 场景分组 {scene_index} 为空或格式错误")
+        parsed = [_parse_bin_token(token) for token in scene_bins]
+        scene_tokens = {scene_token for scene_token, _ in parsed}
+        bin_indices = [bin_index for _, bin_index in parsed]
+        if len(scene_tokens) != 1:
+            raise ValueError(f"val 场景分组 {scene_index} 混入了多个 scene token")
+        if bin_indices != list(range(len(scene_bins))):
+            raise ValueError(f"val 场景分组 {scene_index} 的 bin 序号不连续或未按序排列")
+
+        scene_token = next(iter(scene_tokens))
+        if scene_token in selected_scenes:
+            raise ValueError(f"val 清单含重复 scene token: {scene_token}")
+        selected_scenes.add(scene_token)
+        selected_bins.append(scene_bins[(len(scene_bins) - 1) // 2])
+
+    if len(selected_bins) != CENTER150_SAMPLE_COUNT or len(set(selected_bins)) != CENTER150_SAMPLE_COUNT:
+        raise ValueError("从 val 清单复算后未得到 150 个唯一中央 bin")
+    return selected_bins
+
+
+def load_center150_tokens(version_dir: str) -> List[str]:
+    """严格校验并加载 SVF-GS 生成的 Center150 清单；本项目不生成清单。"""
+    val_manifest = _load_json_object(
+        osp.join(version_dir, "bins_val_3.2m.json"), "OmniScene val 清单"
+    )
+    center150_manifest = _load_json_object(
+        osp.join(version_dir, CENTER150_FILENAME), "SVF-GS Center150 清单"
+    )
+    actual_tokens = center150_manifest.get("bins")
+    if not isinstance(actual_tokens, list):
+        raise ValueError(f"{CENTER150_FILENAME} 必须包含 list 字段 'bins'")
+
+    expected_tokens = _expected_center150_tokens(val_manifest)
+    if actual_tokens != expected_tokens:
+        mismatch_index = next(
+            (idx for idx, pair in enumerate(zip(actual_tokens, expected_tokens)) if pair[0] != pair[1]),
+            min(len(actual_tokens), len(expected_tokens)),
+        )
+        raise ValueError(
+            f"{CENTER150_FILENAME} 与 SVF-GS lower-median 规则不一致，"
+            f"首个差异索引为 {mismatch_index}"
+        )
+
+    bin_info_dir = osp.join(version_dir, "bin_infos_3.2m")
+    missing_infos = [
+        token for token in actual_tokens
+        if not osp.isfile(osp.join(bin_info_dir, token + ".pkl"))
+    ]
+    if missing_infos:
+        raise FileNotFoundError(
+            f"Center150 有 {len(missing_infos)} 个 bin 缺少 bin info；"
+            f"前几个为: {', '.join(missing_infos[:3])}"
+        )
+    return list(actual_tokens)
+
+
 def get_bin_tokens(data_root: str, stage: str) -> List[str]:
     """获取 bin 列表（遵循 depthsplat 的 OmniScene 采样规则）。"""
     data_version = "interp_12Hz_trainval"
-    bins_path = osp.join(data_root, data_version, "bins_val_3.2m.json")
+    version_dir = osp.join(data_root, data_version)
+    if stage == "center150":
+        return load_center150_tokens(version_dir)
+
+    bins_path = osp.join(version_dir, "bins_val_3.2m.json")
     if stage == "train":
         bins_path = osp.join(data_root, data_version, "bins_train_3.2m.json")
     bins = json.load(open(bins_path))["bins"]
@@ -199,6 +305,25 @@ def get_bin_tokens(data_root: str, stage: str) -> List[str]:
     return bins
 
 
+def _ensure_canonical_eval_names(test_json: str) -> None:
+    """Keep the 18 evaluation views aligned with SVF-GS names 00--17."""
+    with open(test_json, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    frames = data.get("frames", [])
+    if len(frames) != 18:
+        raise ValueError(f"OmniScene evaluation split must contain 18 views, got {len(frames)}: {test_json}")
+
+    expected_names = [f"{idx:02d}" for idx in range(len(frames))]
+    if [frame.get("image_name") for frame in frames] == expected_names:
+        return
+
+    for image_name, frame in zip(expected_names, frames):
+        frame["image_name"] = image_name
+    with open(test_json, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+
 def preprocess_scene(
     data_root: str,
     output_root: str,
@@ -220,7 +345,11 @@ def preprocess_scene(
     points_dir = osp.join(scene_dir, "points")
     cams_dir = osp.join(scene_dir, "cams")
 
-    if osp.exists(osp.join(cams_dir, "train.json")) and osp.exists(osp.join(points_dir, "init_points.ply")):
+    train_json = osp.join(cams_dir, "train.json")
+    test_json = osp.join(cams_dir, "test.json")
+    init_ply = osp.join(points_dir, "init_points.ply")
+    if osp.exists(train_json) and osp.exists(test_json) and osp.exists(init_ply):
+        _ensure_canonical_eval_names(test_json)
         return scene_dir
 
     _ensure_dir(images_train_dir)
@@ -356,8 +485,9 @@ def preprocess_scene(
         with open(out_json, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
 
-    _dump_frames(train_frames, osp.join(cams_dir, "train.json"))
-    _dump_frames(test_frames, osp.join(cams_dir, "test.json"))
+    _dump_frames(train_frames, train_json)
+    _dump_frames(test_frames, test_json)
+    _ensure_canonical_eval_names(test_json)
 
     # 构建初始化点云
     xyz, rgb = _make_point_cloud(
@@ -367,7 +497,7 @@ def preprocess_scene(
         confs_m=train_confs,
         conf_threshold=conf_threshold,
     )
-    _store_ply(osp.join(points_dir, "init_points.ply"), xyz, rgb)
+    _store_ply(init_ply, xyz, rgb)
     return scene_dir
 
 

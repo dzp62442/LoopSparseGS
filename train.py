@@ -1,9 +1,11 @@
+import json
 import os
+import time
 import numpy as np
 import torch
 from random import randint
 from utils.loss_utils import l1_loss, ssim, compute_pearson_loss, compute_patch_pearson_loss, compute_depth_loss
-from lpipsPyTorch import lpips
+from lpipsPyTorch import LPIPS, lpips
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
@@ -59,6 +61,8 @@ def training(dataset, opt, pipe, args):
         'max_lpips': 0,
         'max_iter' : -1,
         }
+    training_timer_start = time.perf_counter()
+    excluded_training_overhead = 0.0
     
     print("\nTraining Start! Switch depth l1 loss: {}, mono pearson loss: {}, \nPseudo supervised:{}, pseudo_loop_iters:{}, sparse_sampling:{}".format(args.use_depth, \
                                             args.use_pearson, args.use_pseudo_view, args.pseudo_loop_iters, args.sparse_sampling))
@@ -183,11 +187,33 @@ def training(dataset, opt, pipe, args):
 
             # Log and save
             # adding max psnr record
-            record_psnr = training_report(tb_writer, iteration, Ll1, pearson_loss, depth_loss, loss, l1_loss, opacity_loss, iter_start.elapsed_time(iter_end), \
-                                          testing_iterations, scene, render, (pipe, background), record_psnr=record_psnr)
+            is_full_evaluation = args.full_eval_metrics and iteration in testing_iterations
+            training_time_seconds = None
+            evaluation_overhead_start = None
+            if is_full_evaluation:
+                torch.cuda.synchronize()
+                evaluation_overhead_start = time.perf_counter()
+                training_time_seconds = (
+                    evaluation_overhead_start
+                    - training_timer_start
+                    - excluded_training_overhead
+                )
+            record_psnr = training_report(args, tb_writer, iteration, Ll1, pearson_loss, depth_loss, loss, l1_loss, opacity_loss, iter_start.elapsed_time(iter_end), \
+                                          testing_iterations, scene, render, (pipe, background), record_psnr=record_psnr, \
+                                          full_eval_metrics=args.full_eval_metrics, training_time_seconds=training_time_seconds)
+            if is_full_evaluation:
+                torch.cuda.synchronize()
+                excluded_training_overhead += time.perf_counter() - evaluation_overhead_start
             if (iteration in saving_iterations):
+                save_overhead_start = None
+                if args.full_eval_metrics:
+                    torch.cuda.synchronize()
+                    save_overhead_start = time.perf_counter()
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
+                if args.full_eval_metrics:
+                    torch.cuda.synchronize()
+                    excluded_training_overhead += time.perf_counter() - save_overhead_start
 
             # Densification
             if iteration < opt.densify_until_iter:
@@ -241,8 +267,71 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def training_report(tb_writer, iteration, Ll1, pearson_loss, depth_loss, loss, l1_loss, opacity_loss, \
-                    elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, record_psnr={}):
+def _atomic_write_text(path, content):
+    temporary_path = path + ".tmp"
+    with open(temporary_path, "w", encoding="utf-8") as output_file:
+        output_file.write(content)
+    os.replace(temporary_path, path)
+
+
+def write_evaluation_record(model_path, iteration, num_views, l1_value, psnr_value,
+                            ssim_value, lpips_value, training_time_seconds):
+    """Atomically persist milestone metrics in both JSON and baseline-compatible text files."""
+    evaluation_dir = os.path.join(model_path, "evaluation")
+    os.makedirs(evaluation_dir, exist_ok=True)
+    payload = {
+        "format_version": 1,
+        "iteration": int(iteration),
+        "split": "test",
+        "num_views": int(num_views),
+        "metrics": {
+            "l1": float(l1_value),
+            "psnr": float(psnr_value),
+            "ssim": float(ssim_value),
+            "lpips": float(lpips_value),
+        },
+        "training_time_seconds": float(training_time_seconds),
+    }
+    evaluation_path = os.path.join(evaluation_dir, "iteration_{}.json".format(iteration))
+    temporary_path = evaluation_path + ".tmp"
+    with open(temporary_path, "w", encoding="utf-8") as evaluation_file:
+        json.dump(payload, evaluation_file, ensure_ascii=False, indent=2)
+        evaluation_file.write("\n")
+    os.replace(temporary_path, evaluation_path)
+
+    _atomic_write_text(
+        os.path.join(model_path, "metrics_{}.txt".format(iteration)),
+        "PSNR : {:>12.7f}\nSSIM : {:>12.7f}\nLPIPS : {:>12.7f}\n".format(
+            psnr_value, ssim_value, lpips_value
+        ),
+    )
+    _atomic_write_text(
+        os.path.join(model_path, "training_time_{}.txt".format(iteration)),
+        "TRAINING_TIME_SECONDS : {:.7f}\n".format(training_time_seconds),
+    )
+
+
+def _prepare_full_eval_directories(model_path, iteration):
+    iteration_dir = os.path.join(model_path, "test", "ours_{}".format(iteration))
+    render_path = os.path.join(iteration_dir, "renders")
+    gt_path = os.path.join(iteration_dir, "gt")
+    os.makedirs(render_path, exist_ok=True)
+    os.makedirs(gt_path, exist_ok=True)
+    for output_dir in (render_path, gt_path):
+        for filename in os.listdir(output_dir):
+            if filename.endswith(".png"):
+                os.remove(os.path.join(output_dir, filename))
+    return render_path, gt_path
+
+
+def training_report(args, tb_writer, iteration, Ll1, pearson_loss, depth_loss, loss, l1_loss, opacity_loss, \
+                    elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, record_psnr=None, \
+                    full_eval_metrics=False, training_time_seconds=None):
+    if record_psnr is None:
+        record_psnr = {
+            'psnr_process': [], 'max_psnr': 0, 'max_ssim': 0,
+            'max_lpips': 0, 'max_iter': -1,
+        }
     if tb_writer:
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/opacity_loss', opacity_loss.item(), iteration)
@@ -254,13 +343,28 @@ def training_report(tb_writer, iteration, Ll1, pearson_loss, depth_loss, loss, l
 
     # Report test and samples of training set
     if iteration in testing_iterations:
+        cpu_rng_state = torch.get_rng_state() if full_eval_metrics else None
+        cuda_rng_state = torch.cuda.get_rng_state() if full_eval_metrics else None
         torch.cuda.empty_cache()
-        validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
-                              {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
+        if full_eval_metrics:
+            validation_configs = ({'name': 'test', 'cameras': scene.getTestCameras()},)
+        else:
+            validation_configs = (
+                {'name': 'test', 'cameras': scene.getTestCameras()},
+                {'name': 'train', 'cameras': [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]},
+            )
         psnr_process = record_psnr['psnr_process']
         max_psnr, max_ssim, max_lpips, max_iter = record_psnr['max_psnr'], record_psnr['max_ssim'], record_psnr['max_lpips'], record_psnr['max_iter']
         for config in validation_configs:
             if config['cameras'] and len(config['cameras']) > 0:
+                is_full_test_eval = full_eval_metrics and config['name'] == 'test'
+                if is_full_test_eval:
+                    if training_time_seconds is None:
+                        raise ValueError("full evaluation requires cumulative training time")
+                    render_path, gt_path = _prepare_full_eval_directories(args.model_path, iteration)
+                    lpips_metric = LPIPS(net_type='vgg').to('cuda').eval()
+                else:
+                    lpips_metric = None
                 l1_test = 0.0
                 psnr_test = 0.0
                 ssim_test = 0.0
@@ -286,17 +390,38 @@ def training_report(tb_writer, iteration, Ll1, pearson_loss, depth_loss, loss, l
                                 tb_writer.add_images(config['name'] + "_view_{}/depth_ground_truth".format(viewpoint.image_name), gt_depth, global_step=iteration)
                         
                     l1_test += l1_loss(image, gt_image).mean().double()
-                    psnr_test += psnr(image, gt_image).mean().double()
-                    ssim_test += ssim(image, gt_image).mean().double()
-                    lpips_test += lpips(image, gt_image, net_type='vgg').mean().double()
+                    psnr_test += psnr(image[None], gt_image[None]).mean().double()
+                    ssim_test += ssim(image[None], gt_image[None]).mean().double()
+                    if is_full_test_eval:
+                        lpips_test += lpips_metric(image[None], gt_image[None]).mean().double()
+                        torchvision.utils.save_image(
+                            image, os.path.join(render_path, viewpoint.image_name + ".png")
+                        )
+                        torchvision.utils.save_image(
+                            gt_image, os.path.join(gt_path, viewpoint.image_name + ".png")
+                        )
+                    else:
+                        lpips_test += lpips(image[None], gt_image[None], net_type='vgg').mean().double()
                 psnr_test /= len(config['cameras'])
                 ssim_test /= len(config['cameras'])
                 lpips_test /= len(config['cameras'])
                 l1_test /= len(config['cameras'])
                 
                 if config['name'] == "test":
-                    print("\n[ITER {}] Evaluating {}: L1 {:.4f} PSNR {:.3f} SSIM {:.3f} LPIPS {:.3f}".format(iteration, config['name'], \
-                                                                                         l1_test, psnr_test, ssim_test, lpips_test))
+                    if is_full_test_eval:
+                        write_evaluation_record(
+                            args.model_path,
+                            iteration,
+                            len(config['cameras']),
+                            l1_test.item(),
+                            psnr_test.item(),
+                            ssim_test.item(),
+                            lpips_test.item(),
+                            training_time_seconds,
+                        )
+                    print("\n[ITER {}] Evaluating {}: L1 {:.4f} PSNR {:.3f} SSIM {:.3f} LPIPS {:.3f}{}".format(iteration, config['name'], \
+                                                                                         l1_test, psnr_test, ssim_test, lpips_test, \
+                                                                                         " TRAIN_TIME {:.3f}s".format(training_time_seconds) if is_full_test_eval else ""))
                     psnr_process.append("\n[ITER {}] Evaluating {}: L1 {:.4f} PSNR {:.3f} SSIM {:.3f} LPIPS {:.3f}".format(iteration, config['name'], \
                                                                                          l1_test, psnr_test, ssim_test, lpips_test))
                     if max_psnr < psnr_test:
@@ -309,6 +434,10 @@ def training_report(tb_writer, iteration, Ll1, pearson_loss, depth_loss, loss, l
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - ssim', ssim_test, iteration)
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - lpips', lpips_test, iteration)
+                    if is_full_test_eval:
+                        tb_writer.add_scalar(config['name'] + '/training_time_seconds', training_time_seconds, iteration)
+                if lpips_metric is not None:
+                    del lpips_metric
 
         if tb_writer:
             opacity = scene.gaussians.get_opacity.detach().float().cpu().view(-1)
@@ -329,6 +458,9 @@ def training_report(tb_writer, iteration, Ll1, pearson_loss, depth_loss, loss, l
                     global_step=iteration,
                 )
             tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
+        if full_eval_metrics:
+            torch.set_rng_state(cpu_rng_state)
+            torch.cuda.set_rng_state(cuda_rng_state)
         torch.cuda.empty_cache()
         return {
             'psnr_process': psnr_process,
@@ -348,11 +480,13 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[2500])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[10_000])
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[10_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
+    parser.add_argument("--full_eval_metrics", action="store_true",
+                        help="保存完整测试集图像、指标与累计纯训练耗时")
     parser.add_argument("--dataset_type", type=str, default = 'llff')
     parser.add_argument("--train_sub", type=int, default = 3)  
     parser.add_argument("--debug_init", action="store_true", help="full images init, but few views train") 
@@ -384,7 +518,8 @@ if __name__ == "__main__":
     training(lp.extract(args), op.extract(args), pp.extract(args), args)
     # All done
     print("\nTraining complete.")
-    os.system(f"python render.py -m {args.model_path} --skip_train --render_depth")
+    if not args.full_eval_metrics:
+        os.system(f"python render.py -m {args.model_path} --skip_train --render_depth")
     # os.system(f"python tools/loop.py -p {args.pseudo_loop_iters} -s {args.source_path} -m {args.model_path} --train_sub {args.train_sub}")
         
         
