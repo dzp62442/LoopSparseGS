@@ -15,6 +15,25 @@ from scripts import run_omniscene
 EVAL_ITERATIONS = (1000, 5000, 10000)
 
 
+class DummyMetricEvaluator:
+    class Device:
+        type = "cpu"
+
+    device = Device()
+
+    def __init__(self, value=4.0):
+        self.value = value
+
+    def evaluate(self, render_dir, gt_dir, image_names):
+        assert tuple(image_names) == run_omniscene.NOVEL_IMAGE_NAMES
+        return {
+            "l1": self.value + 0.01,
+            "psnr": self.value + 20.0,
+            "ssim": self.value / 10.0,
+            "lpips": self.value / 20.0,
+        }
+
+
 def _write_json(path, payload):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload), encoding="utf-8")
@@ -111,6 +130,25 @@ class Center150ManifestTest(unittest.TestCase):
 
 
 class Center150RunnerTest(unittest.TestCase):
+    def test_backfill_adds_novel_metrics_without_changing_training_time(self):
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            _, model_dir = _make_complete_sample(root, "scene")
+            time_path = model_dir / "training_time_1000.txt"
+            original_time_bytes = time_path.read_bytes()
+            original_evaluation = run_omniscene.load_evaluation_record(model_dir, 1000)
+
+            result = run_omniscene.backfill_novel_12_metrics(
+                model_dir, 1000, DummyMetricEvaluator()
+            )
+
+            updated = run_omniscene.load_evaluation_record(model_dir, 1000)
+            self.assertEqual(time_path.read_bytes(), original_time_bytes)
+            self.assertEqual(updated["training_time_seconds"], 10.0)
+            self.assertEqual(updated["metrics"], original_evaluation["metrics"])
+            self.assertAlmostEqual(result["psnr"], 24.0)
+            self.assertTrue(run_omniscene.has_novel_12_metrics(model_dir, 1000))
+
     def test_nonempty_unversioned_run_root_is_not_adopted(self):
         with tempfile.TemporaryDirectory() as temporary_dir:
             run_root = Path(temporary_dir)
@@ -185,6 +223,10 @@ class Center150RunnerTest(unittest.TestCase):
                 name = "scene{}".format(index)
                 scene_dir, model_dir = _make_complete_sample(root, name, value)
                 samples.append((name, "token{}".format(index), scene_dir, model_dir))
+                for iteration in EVAL_ITERATIONS:
+                    run_omniscene.backfill_novel_12_metrics(
+                        model_dir, iteration, DummyMetricEvaluator(value + 10.0)
+                    )
 
             with mock.patch.object(run_omniscene, "CENTER150_SAMPLE_COUNT", 2):
                 summary = run_omniscene.aggregate_center150(
@@ -194,6 +236,10 @@ class Center150RunnerTest(unittest.TestCase):
             self.assertAlmostEqual(summary["averages"]["1000"]["psnr"], 23.0)
             self.assertAlmostEqual(
                 summary["averages"]["10000"]["training_time_seconds"], 30.0
+            )
+            self.assertAlmostEqual(
+                summary["view_subsets"]["novel_12"]["averages"]["1000"]["psnr"],
+                32.0,
             )
             self.assertTrue((root / "runs" / "center150_metrics_summary.json").exists())
             self.assertTrue((root / "runs" / "center150_metrics_summary.txt").exists())

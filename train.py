@@ -28,6 +28,9 @@ try:
 except ImportError:
     TENSORBOARD_FOUND = False
 depth2img = lambda x: ((x-x.min())/(x.max()-x.min()))
+NOVEL_VIEW_NAMES = {"{:02d}".format(index) for index in range(12)}
+
+
 def training(dataset, opt, pipe, args):
     
     testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, dataset_type, train_sub, PMS_init = args.test_iterations, \
@@ -274,24 +277,48 @@ def _atomic_write_text(path, content):
     os.replace(temporary_path, path)
 
 
+def _format_metric_text(metrics):
+    return "PSNR : {:>12.7f}\nSSIM : {:>12.7f}\nLPIPS : {:>12.7f}\n".format(
+        metrics["psnr"], metrics["ssim"], metrics["lpips"]
+    )
+
+
 def write_evaluation_record(model_path, iteration, num_views, l1_value, psnr_value,
-                            ssim_value, lpips_value, training_time_seconds):
+                            ssim_value, lpips_value, training_time_seconds,
+                            novel_12_metrics=None):
     """Atomically persist milestone metrics in both JSON and baseline-compatible text files."""
     evaluation_dir = os.path.join(model_path, "evaluation")
     os.makedirs(evaluation_dir, exist_ok=True)
+    all_18_metrics = {
+        "l1": float(l1_value),
+        "psnr": float(psnr_value),
+        "ssim": float(ssim_value),
+        "lpips": float(lpips_value),
+    }
     payload = {
         "format_version": 1,
         "iteration": int(iteration),
         "split": "test",
         "num_views": int(num_views),
-        "metrics": {
-            "l1": float(l1_value),
-            "psnr": float(psnr_value),
-            "ssim": float(ssim_value),
-            "lpips": float(lpips_value),
-        },
+        "metrics": all_18_metrics,
         "training_time_seconds": float(training_time_seconds),
     }
+    if novel_12_metrics is not None:
+        payload["view_metrics"] = {
+            "all_18": {
+                "num_views": int(num_views),
+                "metrics": all_18_metrics,
+                "source": "in_loop_float",
+            },
+            "novel_12": {
+                "num_views": 12,
+                "image_names": ["{:02d}.png".format(index) for index in range(12)],
+                "metrics": {
+                    name: float(value) for name, value in novel_12_metrics.items()
+                },
+                "source": "in_loop_float",
+            },
+        }
     evaluation_path = os.path.join(evaluation_dir, "iteration_{}.json".format(iteration))
     temporary_path = evaluation_path + ".tmp"
     with open(temporary_path, "w", encoding="utf-8") as evaluation_file:
@@ -301,10 +328,13 @@ def write_evaluation_record(model_path, iteration, num_views, l1_value, psnr_val
 
     _atomic_write_text(
         os.path.join(model_path, "metrics_{}.txt".format(iteration)),
-        "PSNR : {:>12.7f}\nSSIM : {:>12.7f}\nLPIPS : {:>12.7f}\n".format(
-            psnr_value, ssim_value, lpips_value
-        ),
+        _format_metric_text(all_18_metrics),
     )
+    if novel_12_metrics is not None:
+        _atomic_write_text(
+            os.path.join(model_path, "metrics_novel_12_{}.txt".format(iteration)),
+            _format_metric_text(novel_12_metrics),
+        )
     _atomic_write_text(
         os.path.join(model_path, "training_time_{}.txt".format(iteration)),
         "TRAINING_TIME_SECONDS : {:.7f}\n".format(training_time_seconds),
@@ -369,6 +399,11 @@ def training_report(args, tb_writer, iteration, Ll1, pearson_loss, depth_loss, l
                 psnr_test = 0.0
                 ssim_test = 0.0
                 lpips_test = 0.0
+                novel_l1_test = 0.0
+                novel_psnr_test = 0.0
+                novel_ssim_test = 0.0
+                novel_lpips_test = 0.0
+                novel_view_names = set()
                 for idx, viewpoint in enumerate(config['cameras']):
                     vis_render = renderFunc(viewpoint, scene.gaussians, *renderArgs)
                     image = torch.clamp(vis_render["render"], 0.0, 1.0)
@@ -389,11 +424,11 @@ def training_report(args, tb_writer, iteration, Ll1, pearson_loss, depth_loss, l
                             if iteration == testing_iterations[0]:
                                 tb_writer.add_images(config['name'] + "_view_{}/depth_ground_truth".format(viewpoint.image_name), gt_depth, global_step=iteration)
                         
-                    l1_test += l1_loss(image, gt_image).mean().double()
-                    psnr_test += psnr(image[None], gt_image[None]).mean().double()
-                    ssim_test += ssim(image[None], gt_image[None]).mean().double()
+                    view_l1 = l1_loss(image, gt_image).mean().double()
+                    view_psnr = psnr(image[None], gt_image[None]).mean().double()
+                    view_ssim = ssim(image[None], gt_image[None]).mean().double()
                     if is_full_test_eval:
-                        lpips_test += lpips_metric(image[None], gt_image[None]).mean().double()
+                        view_lpips = lpips_metric(image[None], gt_image[None]).mean().double()
                         torchvision.utils.save_image(
                             image, os.path.join(render_path, viewpoint.image_name + ".png")
                         )
@@ -401,11 +436,37 @@ def training_report(args, tb_writer, iteration, Ll1, pearson_loss, depth_loss, l
                             gt_image, os.path.join(gt_path, viewpoint.image_name + ".png")
                         )
                     else:
-                        lpips_test += lpips(image[None], gt_image[None], net_type='vgg').mean().double()
+                        view_lpips = lpips(
+                            image[None], gt_image[None], net_type='vgg'
+                        ).mean().double()
+                    l1_test += view_l1
+                    psnr_test += view_psnr
+                    ssim_test += view_ssim
+                    lpips_test += view_lpips
+                    if is_full_test_eval and viewpoint.image_name in NOVEL_VIEW_NAMES:
+                        novel_l1_test += view_l1
+                        novel_psnr_test += view_psnr
+                        novel_ssim_test += view_ssim
+                        novel_lpips_test += view_lpips
+                        novel_view_names.add(viewpoint.image_name)
                 psnr_test /= len(config['cameras'])
                 ssim_test /= len(config['cameras'])
                 lpips_test /= len(config['cameras'])
                 l1_test /= len(config['cameras'])
+                novel_12_metrics = None
+                if is_full_test_eval:
+                    if novel_view_names != NOVEL_VIEW_NAMES:
+                        raise ValueError(
+                            "novel-12 视角必须恰好为 00--11，实际为 {}".format(
+                                sorted(novel_view_names)
+                            )
+                        )
+                    novel_12_metrics = {
+                        "l1": (novel_l1_test / 12).item(),
+                        "psnr": (novel_psnr_test / 12).item(),
+                        "ssim": (novel_ssim_test / 12).item(),
+                        "lpips": (novel_lpips_test / 12).item(),
+                    }
                 
                 if config['name'] == "test":
                     if is_full_test_eval:
@@ -418,10 +479,22 @@ def training_report(args, tb_writer, iteration, Ll1, pearson_loss, depth_loss, l
                             ssim_test.item(),
                             lpips_test.item(),
                             training_time_seconds,
+                            novel_12_metrics,
                         )
                     print("\n[ITER {}] Evaluating {}: L1 {:.4f} PSNR {:.3f} SSIM {:.3f} LPIPS {:.3f}{}".format(iteration, config['name'], \
                                                                                          l1_test, psnr_test, ssim_test, lpips_test, \
                                                                                          " TRAIN_TIME {:.3f}s".format(training_time_seconds) if is_full_test_eval else ""))
+                    if is_full_test_eval:
+                        print(
+                            "[ITER {}] Evaluating novel_12: L1 {:.4f} PSNR {:.3f} "
+                            "SSIM {:.3f} LPIPS {:.3f}".format(
+                                iteration,
+                                novel_12_metrics["l1"],
+                                novel_12_metrics["psnr"],
+                                novel_12_metrics["ssim"],
+                                novel_12_metrics["lpips"],
+                            )
+                        )
                     psnr_process.append("\n[ITER {}] Evaluating {}: L1 {:.4f} PSNR {:.3f} SSIM {:.3f} LPIPS {:.3f}".format(iteration, config['name'], \
                                                                                          l1_test, psnr_test, ssim_test, lpips_test))
                     if max_psnr < psnr_test:
@@ -436,6 +509,10 @@ def training_report(args, tb_writer, iteration, Ll1, pearson_loss, depth_loss, l
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - lpips', lpips_test, iteration)
                     if is_full_test_eval:
                         tb_writer.add_scalar(config['name'] + '/training_time_seconds', training_time_seconds, iteration)
+                        for metric_name, metric_value in novel_12_metrics.items():
+                            tb_writer.add_scalar(
+                                'test_novel_12/' + metric_name, metric_value, iteration
+                            )
                 if lpips_metric is not None:
                     del lpips_metric
 

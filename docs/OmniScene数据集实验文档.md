@@ -7,7 +7,7 @@
 - 使用 nuScenes val 的 150 个场景，每个场景只取一个中央 bin；
 - 每个样本从头初始化并进行一次连续的 10,000 次优化；
 - 在同一条训练轨迹的 1,000、5,000、10,000 次迭代处评估；
-- 每次评估完整的 18 个目标视角，保存 PSNR、SSIM、LPIPS 和累计训练耗时；
+- 每次同时报告完整 18 路目标视角和前 12 路新视角（`00`--`11`）的 PSNR、SSIM、LPIPS，并保存累计训练耗时；
 - 150 个样本全部完成后，按场景等权平均并自动生成汇总结果。
 
 这不是四轮独立训练，也不会根据中间评估结果调整或重启优化。
@@ -63,7 +63,7 @@ Metric3D 深度、置信度阈值、深度截断/存储尺度以及初始点云�
 -sps
 ```
 
-三个里程碑属于同一次连续优化。中间评估只读取当前高斯状态，不加载新权重、不反馈指标、不改变训练参数；评估前后的 Torch RNG 状态会恢复，以免评估影响后续训练轨迹。
+三个里程碑属于同一次连续优化。中间评估只读取当前高斯状态，不加载新权重、不反馈指标、不改变训练参数；评估前后的 Torch RNG 状态会恢复，以免评估影响后续训练轨迹。18 路指标使用 `00`--`17`，其中 `novel_12` 严格按图像名选取 `00`--`11`，不依赖可能被 shuffle 的相机遍历顺序。
 
 每个里程碑写出：
 
@@ -71,12 +71,15 @@ Metric3D 深度、置信度阈值、深度截断/存储尺度以及初始点云�
 <scene_output>/
   evaluation/iteration_<N>.json
   metrics_<N>.txt
+  metrics_novel_12_<N>.txt
   training_time_<N>.txt
   test/ours_<N>/renders/00.png ... 17.png
   test/ours_<N>/gt/00.png ... 17.png
 ```
 
-其中 `training_time_seconds` 是从优化循环开始到该里程碑的累计 wall time，排除了完整评估和高斯 PLY 保存所消耗的时间。场景初始化和预处理耗时也不计入训练耗时。
+其中 `evaluation/iteration_<N>.json` 同时包含兼容旧格式的 18 路 `metrics`，以及 `view_metrics.all_18` 和 `view_metrics.novel_12`。`training_time_seconds` 是从优化循环开始到该里程碑的累计 wall time，排除了完整评估和高斯 PLY 保存所消耗的时间。场景初始化和预处理耗时也不计入训练耗时。
+
+对于已经完成的旧实验，脚本不会重新训练，也不会覆盖已有 18 路指标和 `training_time_<N>.txt`；它只会从已保存的 `renders/gt` 中读取 `00.png`--`11.png`，在指定设备上补算 12 路新视角指标。新实验会在训练内即时报告两组指标，runner 随后仍以保存的 PNG 统一落盘 `novel_12`，使新旧实验采用相同的 12 路统计输入。
 
 为了避免大量无用 I/O，只在 10,000 次迭代保存最终：
 
@@ -106,7 +109,7 @@ point_cloud/iteration_10000/point_cloud.ply
 <run_root>/center150_metrics_summary.txt
 ```
 
-汇总包含每个样本的三个里程碑记录，以及 1k、5k、10k 时 PSNR、SSIM、LPIPS、累计纯训练耗时的 150 场景等权平均值。
+汇总包含每个样本的三个里程碑记录，以及 1k、5k、10k 时 18 路、12 路新视角 PSNR/SSIM/LPIPS 和累计纯训练耗时的 150 场景等权平均值。旧的 `averages` 字段继续表示 18 路结果，新增的 `view_subsets` 同时给出 `all_18` 与 `novel_12`。
 
 实验根目录还会保存 `experiment_config.json`。若对同一 `--run_root` 使用不同数据路径、分辨率、迭代里程碑或 SPS 配置，脚本会拒绝混合结果，并提示换用新输出目录；对于没有该配置文件的既有非空目录也不会自动接管，避免覆盖旧版实验。
 
@@ -135,3 +138,11 @@ python scripts/run_omniscene.py \
 ```
 
 最后一个评估里程碑必须等于总迭代数。若确需关闭 LoopSparseGS 默认启用的 sparse-friendly sampling，可额外传入 `--disable_sps`。
+
+若只想为已经完整训练的场景补算指标并确保绝不启动训练，可使用：
+
+```bash
+CUDA_VISIBLE_DEVICES='' python scripts/run_omniscene.py \
+  --metrics_only \
+  --metric_device cpu
+```

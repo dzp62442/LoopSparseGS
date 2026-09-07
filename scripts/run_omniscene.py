@@ -17,14 +17,18 @@ from comp_svfgs.dataset_omniscene import (  # noqa: E402
     get_bin_tokens,
     preprocess_scene,
 )
+from comp_svfgs.evaluation_metrics import SavedImageMetricEvaluator  # noqa: E402
 
 
 DEFAULT_TOTAL_ITERATIONS = 10_000
 DEFAULT_EVAL_ITERATIONS = (1_000, 5_000, 10_000)
 EVALUATION_FORMAT_VERSION = 1
 EXPERIMENT_FORMAT_VERSION = 1
-SUMMARY_FORMAT_VERSION = 1
+SUMMARY_FORMAT_VERSION = 2
 METRIC_NAMES = ("psnr", "ssim", "lpips")
+ALL_VIEW_SUBSET = "all_18"
+NOVEL_VIEW_SUBSET = "novel_12"
+NOVEL_IMAGE_NAMES = tuple("{:02d}.png".format(index) for index in range(12))
 
 
 def _run_cmd(cmd: Sequence[str]) -> None:
@@ -163,6 +167,24 @@ def _parse_training_time_text(path: Path) -> float:
     return training_time
 
 
+def _validated_metric_mapping(metrics: Dict, description: str) -> Dict[str, float]:
+    if not isinstance(metrics, dict):
+        raise ValueError("{}缺少指标字典".format(description))
+    values = {name: metrics.get(name) for name in ("l1",) + METRIC_NAMES}
+    if not all(
+        isinstance(value, (int, float)) and math.isfinite(value)
+        for value in values.values()
+    ):
+        raise ValueError("{}包含无效指标".format(description))
+    return {name: float(value) for name, value in values.items()}
+
+
+def _format_metric_text(metrics: Dict[str, float]) -> str:
+    return "PSNR : {:>12.7f}\nSSIM : {:>12.7f}\nLPIPS : {:>12.7f}\n".format(
+        metrics["psnr"], metrics["ssim"], metrics["lpips"]
+    )
+
+
 def load_evaluation_record(model_dir: Path, iteration: int) -> Dict:
     evaluation_path = model_dir / "evaluation" / "iteration_{}.json".format(iteration)
     record = json.loads(evaluation_path.read_text(encoding="utf-8"))
@@ -173,15 +195,13 @@ def load_evaluation_record(model_dir: Path, iteration: int) -> Dict:
     if record.get("num_views") != 18:
         raise ValueError("评估记录必须包含 18 个视角: {}".format(evaluation_path))
 
-    metrics = record.get("metrics")
-    if not isinstance(metrics, dict):
-        raise ValueError("评估记录缺少 metrics: {}".format(evaluation_path))
-    required_values = [metrics.get(name) for name in METRIC_NAMES]
-    required_values.append(metrics.get("l1"))
-    required_values.append(record.get("training_time_seconds"))
-    if not all(isinstance(value, (int, float)) and math.isfinite(value) for value in required_values):
-        raise ValueError("评估记录包含无效数值: {}".format(evaluation_path))
-    if record["training_time_seconds"] < 0.0:
+    metrics = _validated_metric_mapping(
+        record.get("metrics"), "评估记录 {}".format(evaluation_path)
+    )
+    training_time = record.get("training_time_seconds")
+    if not isinstance(training_time, (int, float)) or not math.isfinite(training_time):
+        raise ValueError("评估记录包含无效训练耗时: {}".format(evaluation_path))
+    if training_time < 0.0:
         raise ValueError("训练耗时不能为负数: {}".format(evaluation_path))
 
     text_metrics = _parse_metric_text(model_dir / "metrics_{}.txt".format(iteration))
@@ -194,10 +214,104 @@ def load_evaluation_record(model_dir: Path, iteration: int) -> Dict:
         ):
             raise ValueError("JSON 与文本指标不一致: {}".format(evaluation_path))
     if not math.isclose(
-        float(record["training_time_seconds"]), text_time, rel_tol=1e-6, abs_tol=1e-6
+        float(training_time), text_time, rel_tol=1e-6, abs_tol=1e-6
     ):
         raise ValueError("JSON 与文本训练耗时不一致: {}".format(evaluation_path))
     return record
+
+
+def load_novel_12_metrics(model_dir: Path, iteration: int,
+                          evaluation: Dict = None,
+                          require_saved_png: bool = False) -> Dict[str, float]:
+    if evaluation is None:
+        evaluation = load_evaluation_record(model_dir, iteration)
+    view_metrics = evaluation.get("view_metrics")
+    if not isinstance(view_metrics, dict):
+        raise ValueError("评估记录缺少 view_metrics")
+    novel_record = view_metrics.get(NOVEL_VIEW_SUBSET)
+    if not isinstance(novel_record, dict):
+        raise ValueError("评估记录缺少 novel_12")
+    if novel_record.get("num_views") != 12:
+        raise ValueError("novel_12 必须包含 12 个视角")
+    if tuple(novel_record.get("image_names", ())) != NOVEL_IMAGE_NAMES:
+        raise ValueError("novel_12 图像名必须为 00.png--11.png")
+    source = novel_record.get("source")
+    if require_saved_png and not (
+        isinstance(source, str) and source.startswith("saved_png_")
+    ):
+        raise ValueError("novel_12 尚未使用已保存 PNG 进行统一统计")
+    metrics = _validated_metric_mapping(novel_record.get("metrics"), "novel_12")
+    text_metrics = _parse_metric_text(
+        model_dir / "metrics_novel_12_{}.txt".format(iteration)
+    )
+    for metric_name in METRIC_NAMES:
+        if not math.isclose(
+            metrics[metric_name], text_metrics[metric_name],
+            rel_tol=1e-6, abs_tol=1e-6,
+        ):
+            raise ValueError("novel_12 JSON 与文本指标不一致")
+    return metrics
+
+
+def has_novel_12_metrics(model_dir: Path, iteration: int,
+                         require_saved_png: bool = False) -> bool:
+    try:
+        load_novel_12_metrics(
+            model_dir, iteration, require_saved_png=require_saved_png
+        )
+        return True
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return False
+
+
+def backfill_novel_12_metrics(model_dir: Path, iteration: int,
+                              evaluator: SavedImageMetricEvaluator) -> Dict[str, float]:
+    """Add novel-view metrics without changing existing all-view metrics or timing."""
+    evaluation = load_evaluation_record(model_dir, iteration)
+    iteration_dir = model_dir / "test" / "ours_{}".format(iteration)
+    novel_metrics = evaluator.evaluate(
+        iteration_dir / "renders", iteration_dir / "gt", NOVEL_IMAGE_NAMES
+    )
+    evaluation["view_metrics"] = {
+        ALL_VIEW_SUBSET: {
+            "num_views": 18,
+            "metrics": {
+                name: float(evaluation["metrics"][name])
+                for name in ("l1",) + METRIC_NAMES
+            },
+            "source": "in_loop_float",
+        },
+        NOVEL_VIEW_SUBSET: {
+            "num_views": 12,
+            "image_names": list(NOVEL_IMAGE_NAMES),
+            "metrics": novel_metrics,
+            "source": "saved_png_{}".format(evaluator.device.type),
+        },
+    }
+    _atomic_write_json(
+        model_dir / "evaluation" / "iteration_{}.json".format(iteration),
+        evaluation,
+    )
+    _atomic_write_text(
+        model_dir / "metrics_novel_12_{}.txt".format(iteration),
+        _format_metric_text(novel_metrics),
+    )
+    return novel_metrics
+
+
+def ensure_scene_view_metrics(model_dir: Path, eval_iterations: Sequence[int],
+                              metric_device: str,
+                              evaluator: SavedImageMetricEvaluator = None):
+    backfilled = []
+    for iteration in eval_iterations:
+        if has_novel_12_metrics(model_dir, iteration, require_saved_png=True):
+            continue
+        if evaluator is None:
+            print("[METRICS] 初始化 {} 指标模型".format(metric_device), flush=True)
+            evaluator = SavedImageMetricEvaluator(device=metric_device)
+        backfill_novel_12_metrics(model_dir, iteration, evaluator)
+        backfilled.append(iteration)
+    return evaluator, backfilled
 
 
 def iteration_complete(model_dir: Path, scene_dir: Path, iteration: int) -> bool:
@@ -320,12 +434,23 @@ def aggregate_center150(run_root: Path, samples: Sequence[Tuple[str, str, Path, 
         iteration: {name: [] for name in METRIC_NAMES + ("training_time_seconds",)}
         for iteration in eval_iterations
     }
+    novel_accumulators = {
+        iteration: {name: [] for name in METRIC_NAMES}
+        for iteration in eval_iterations
+    }
     for scene_name, bin_token, scene_dir, model_dir in samples:
         if not scene_complete(model_dir, scene_dir, iterations, eval_iterations):
             raise RuntimeError("样本尚未完整结束，不能汇总: {}".format(scene_name))
         milestones = {}
+        sample_view_subsets = {
+            ALL_VIEW_SUBSET: {},
+            NOVEL_VIEW_SUBSET: {},
+        }
         for iteration in eval_iterations:
             evaluation = load_evaluation_record(model_dir, iteration)
+            novel_metrics = load_novel_12_metrics(
+                model_dir, iteration, evaluation, require_saved_png=True
+            )
             record = {
                 name: float(evaluation["metrics"][name]) for name in METRIC_NAMES
             }
@@ -333,10 +458,19 @@ def aggregate_center150(run_root: Path, samples: Sequence[Tuple[str, str, Path, 
             milestones[str(iteration)] = record
             for name, value in record.items():
                 accumulators[iteration][name].append(value)
+            sample_view_subsets[ALL_VIEW_SUBSET][str(iteration)] = {
+                name: record[name] for name in METRIC_NAMES
+            }
+            sample_view_subsets[NOVEL_VIEW_SUBSET][str(iteration)] = {
+                name: novel_metrics[name] for name in METRIC_NAMES
+            }
+            for name in METRIC_NAMES:
+                novel_accumulators[iteration][name].append(novel_metrics[name])
         sample_records.append({
             "scene_name": scene_name,
             "bin_token": bin_token,
             "milestones": milestones,
+            "view_subsets": sample_view_subsets,
         })
 
     averages = {
@@ -345,6 +479,28 @@ def aggregate_center150(run_root: Path, samples: Sequence[Tuple[str, str, Path, 
             for name, values in accumulators[iteration].items()
         }
         for iteration in eval_iterations
+    }
+    view_subset_averages = {
+        ALL_VIEW_SUBSET: {
+            "num_views": 18,
+            "averages": {
+                str(iteration): {
+                    name: averages[str(iteration)][name] for name in METRIC_NAMES
+                }
+                for iteration in eval_iterations
+            },
+        },
+        NOVEL_VIEW_SUBSET: {
+            "num_views": 12,
+            "image_names": list(NOVEL_IMAGE_NAMES),
+            "averages": {
+                str(iteration): {
+                    name: sum(values) / len(values)
+                    for name, values in novel_accumulators[iteration].items()
+                }
+                for iteration in eval_iterations
+            },
+        },
     }
     summary = {
         "format_version": SUMMARY_FORMAT_VERSION,
@@ -355,6 +511,7 @@ def aggregate_center150(run_root: Path, samples: Sequence[Tuple[str, str, Path, 
         "iterations": iterations,
         "eval_iterations": list(eval_iterations),
         "averages": averages,
+        "view_subsets": view_subset_averages,
         "samples": sample_records,
         "completed_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -365,17 +522,22 @@ def aggregate_center150(run_root: Path, samples: Sequence[Tuple[str, str, Path, 
         "scene_count: {}".format(len(samples)),
         "aggregation: equal_scene_mean",
         "",
-        "iteration,PSNR,SSIM,LPIPS,TRAINING_TIME_SECONDS",
+        "iteration,ALL18_PSNR,ALL18_SSIM,ALL18_LPIPS,"
+        "NOVEL12_PSNR,NOVEL12_SSIM,NOVEL12_LPIPS,TRAINING_TIME_SECONDS",
     ]
     for iteration in eval_iterations:
-        values = averages[str(iteration)]
+        all_values = averages[str(iteration)]
+        novel_values = view_subset_averages[NOVEL_VIEW_SUBSET]["averages"][str(iteration)]
         lines.append(
-            "{},{:.7f},{:.7f},{:.7f},{:.7f}".format(
+            "{},{:.7f},{:.7f},{:.7f},{:.7f},{:.7f},{:.7f},{:.7f}".format(
                 iteration,
-                values["psnr"],
-                values["ssim"],
-                values["lpips"],
-                values["training_time_seconds"],
+                all_values["psnr"],
+                all_values["ssim"],
+                all_values["lpips"],
+                novel_values["psnr"],
+                novel_values["ssim"],
+                novel_values["lpips"],
+                all_values["training_time_seconds"],
             )
         )
     _atomic_write_text(run_root / "center150_metrics_summary.txt", "\n".join(lines) + "\n")
@@ -384,16 +546,28 @@ def aggregate_center150(run_root: Path, samples: Sequence[Tuple[str, str, Path, 
 
 def _print_summary(summary: Dict) -> None:
     print("\nCenter150 全部完成（150 个场景等权平均）")
-    print("iteration      PSNR      SSIM     LPIPS   train_time_s")
+    print("iteration  views         PSNR      SSIM     LPIPS   train_time_s")
     for iteration in summary["eval_iterations"]:
-        values = summary["averages"][str(iteration)]
+        all_values = summary["averages"][str(iteration)]
+        novel_values = summary["view_subsets"][NOVEL_VIEW_SUBSET]["averages"][str(iteration)]
         print(
-            "{:>9d}  {:>8.4f}  {:>8.4f}  {:>8.4f}  {:>13.3f}".format(
+            "{:>9d}  {:<8s}  {:>8.4f}  {:>8.4f}  {:>8.4f}  {:>13.3f}".format(
                 iteration,
-                values["psnr"],
-                values["ssim"],
-                values["lpips"],
-                values["training_time_seconds"],
+                ALL_VIEW_SUBSET,
+                all_values["psnr"],
+                all_values["ssim"],
+                all_values["lpips"],
+                all_values["training_time_seconds"],
+            )
+        )
+        print(
+            "{:>9s}  {:<8s}  {:>8.4f}  {:>8.4f}  {:>8.4f}  {:>13s}".format(
+                "",
+                NOVEL_VIEW_SUBSET,
+                novel_values["psnr"],
+                novel_values["ssim"],
+                novel_values["lpips"],
+                "-",
             )
         )
 
@@ -421,6 +595,10 @@ def main() -> None:
                         help="覆盖实验输出目录")
     parser.add_argument("--disable_sps", action="store_true",
                         help="关闭默认启用的 sparse-friendly sampling")
+    parser.add_argument("--metrics_only", action="store_true",
+                        help="只为完整样本补算/汇总指标，绝不启动训练")
+    parser.add_argument("--metric_device", choices=["cpu", "cuda"], default="cpu",
+                        help="历史图像指标补算设备，默认 cpu")
     args = parser.parse_args()
 
     eval_iterations = _validate_protocol(args.iterations, args.eval_iterations)
@@ -456,6 +634,7 @@ def main() -> None:
 
     prefix_width = max(2, len(str(len(bin_tokens))))
     samples = []
+    metric_evaluator = None
 
     for index, token in enumerate(bin_tokens, 1):
         scene_prefix = str(index).zfill(prefix_width)
@@ -471,6 +650,9 @@ def main() -> None:
         samples.append((exp_name, token, scene_dir, model_dir))
 
         if scene_complete(model_dir, scene_dir, args.iterations, eval_iterations):
+            metric_evaluator, backfilled = ensure_scene_view_metrics(
+                model_dir, eval_iterations, args.metric_device, metric_evaluator
+            )
             if args.stage == "center150":
                 _atomic_write_json(
                     model_dir / "scene_complete.json",
@@ -479,9 +661,21 @@ def main() -> None:
                         eval_iterations, model_dir,
                     ),
                 )
-            print("[SKIP {}/{}] 已完整完成: {}".format(index, len(bin_tokens), exp_name))
+            if backfilled:
+                print(
+                    "[SKIP {}/{}] 训练已完成；已补算 novel_12: {} ({})".format(
+                        index, len(bin_tokens), exp_name,
+                        ",".join(str(iteration) for iteration in backfilled),
+                    )
+                )
+            else:
+                print("[SKIP {}/{}] 已完整完成: {}".format(index, len(bin_tokens), exp_name))
             continue
 
+        if args.metrics_only:
+            raise RuntimeError(
+                "--metrics_only 不会启动训练，但发现不完整样本: {}".format(model_dir)
+            )
         if args.stage == "center150":
             _unlink_if_exists(run_root / "center150_metrics_summary.json")
             _unlink_if_exists(run_root / "center150_metrics_summary.txt")
@@ -505,6 +699,16 @@ def main() -> None:
         ))
         if not scene_complete(model_dir, scene_dir, args.iterations, eval_iterations):
             raise RuntimeError("训练命令结束，但样本产物不完整: {}".format(model_dir))
+        metric_evaluator, backfilled = ensure_scene_view_metrics(
+            model_dir, eval_iterations, args.metric_device, metric_evaluator
+        )
+        if backfilled:
+            print(
+                "[METRICS {}/{}] 已补算 novel_12: {}".format(
+                    index, len(bin_tokens),
+                    ",".join(str(iteration) for iteration in backfilled),
+                )
+            )
         if args.stage == "center150":
             _atomic_write_json(
                 model_dir / "scene_complete.json",
